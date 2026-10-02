@@ -9,16 +9,24 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psutil
 import pytest
 
+from ai.backend.agent.agent import ACTIVE_STATUS_SET, DEAD_STATUS_SET
+from ai.backend.agent.alloc_map import DeviceSlotInfo, DiscretePropertyAllocMap
 from ai.backend.agent.config.unified import AgentConfig
+from ai.backend.agent.docker.intrinsic import CPUPlugin as DockerCPUPlugin
 from ai.backend.agent.errors import InvalidMountPathError, PortConflictError
 from ai.backend.agent.errors.backend import KernelRuntimeNotFoundError
+from ai.backend.agent.kernel_registry.loader.pickle import PickleBasedKernelRegistryLoader
+from ai.backend.agent.kernel_registry.writer.pickle import PickleBasedKernelRegistryWriter
+from ai.backend.agent.kernel_registry.writer.types import KernelRegistrySaveMetadata
 from ai.backend.agent.native import NativeAgentDiscovery
 from ai.backend.agent.native.agent import (
     NativeAgent,
@@ -26,6 +34,7 @@ from ai.backend.agent.native.agent import (
     link_mount,
     resolve_runtime_path,
 )
+from ai.backend.agent.native.intrinsic import MemoryPlugin
 from ai.backend.agent.native.kernel import NativeKernel
 from ai.backend.agent.native.process import (
     LOG_FILENAME,
@@ -37,16 +46,31 @@ from ai.backend.agent.native.process import (
     terminate_process_group,
     write_process_info,
 )
-from ai.backend.agent.resources import Mount
-from ai.backend.agent.types import AgentBackend, get_agent_discovery
-from ai.backend.common.docker import LabelName
+from ai.backend.agent.resources import KernelResourceSpec, Mount
+from ai.backend.agent.types import (
+    AgentBackend,
+    KernelLifecycleStatus,
+    KernelOwnershipData,
+    get_agent_discovery,
+)
+from ai.backend.common.docker import ImageRef, LabelName
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
+from ai.backend.common.events.event_types.session.anycast import SessionFailureAnycastEvent
 from ai.backend.common.types import (
+    AgentId,
     ContainerStatus,
+    DeviceId,
+    DeviceName,
     KernelId,
     MountPermission,
     MountTypes,
+    ResourceSlot,
     ServicePort,
     ServicePortProtocols,
+    SessionId,
+    SessionTypes,
+    SlotName,
+    SlotTypes,
 )
 
 
@@ -398,3 +422,261 @@ class TestWriteDotfiles:
         assert netrc.read_text() == "machine x\n"
         assert netrc.stat().st_mode & 0o777 == 0o600
         assert not outside.exists()
+
+
+class TestRestartRecovery:
+    AGENT_ID = AgentId("i-test")
+
+    @pytest.fixture
+    def scratch_root(self, tmp_path: Path) -> Path:
+        path = tmp_path / "scratches"
+        path.mkdir()
+        return path
+
+    @pytest.fixture
+    def agent(self, tmp_path: Path, scratch_root: Path) -> MagicMock:
+        registry_path = tmp_path / "last_registry.dat"
+        agent = MagicMock(spec=NativeAgent)
+        agent.id = self.AGENT_ID
+        agent._scratch_root = scratch_root
+        agent._registry_loader = PickleBasedKernelRegistryLoader(
+            registry_path, tmp_path / "legacy.dat"
+        )
+        agent._registry_writer = PickleBasedKernelRegistryWriter(registry_path)
+        agent._read_process_info = partial(NativeAgent._read_process_info, agent)
+        agent._mark_exit_handled = partial(NativeAgent._mark_exit_handled, agent)
+        agent.anycast_and_broadcast_event = AsyncMock()
+        return agent
+
+    @pytest.fixture
+    def live_process(self) -> Iterator[psutil.Process]:
+        proc = subprocess.Popen(["/bin/sh", "-c", "sleep 600"], start_new_session=True)
+        threading.Thread(target=proc.wait, daemon=True).start()
+        yield psutil.Process(proc.pid)
+        try:
+            os.killpg(proc.pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _record(
+        self,
+        scratch_root: Path,
+        proc: psutil.Process,
+        *,
+        create_time: float | None = None,
+        owner_agent: str = AGENT_ID,
+        exit_handled: bool = False,
+    ) -> tuple[KernelId, SessionId, Path]:
+        kernel_id, session_id = KernelId(uuid4()), SessionId(uuid4())
+        config_dir = scratch_root / str(kernel_id) / "config"
+        config_dir.mkdir(parents=True)
+        info = KernelProcessInfo(
+            container_id="c" * 64,
+            pid=proc.pid,
+            create_time=proc.create_time() if create_time is None else create_time,
+            image="local/stable/python:3.12-macos",
+            labels={
+                LabelName.KERNEL_ID.value: str(kernel_id),
+                LabelName.SESSION_ID.value: str(session_id),
+                LabelName.OWNER_AGENT.value: owner_agent,
+            },
+            host_ports=[30000, 30001],
+            service_ports=[8080],
+            exit_handled=exit_handled,
+        )
+        write_process_info(config_dir, info)
+        return kernel_id, session_id, config_dir
+
+    def _kernel(self, scratch_root: Path) -> NativeKernel:
+        kernel_id = KernelId(uuid4())
+        kernel = NativeKernel(
+            KernelOwnershipData(kernel_id, SessionId(uuid4()), self.AGENT_ID),
+            "",
+            ImageRef(
+                name="python",
+                project="stable",
+                tag="3.12-macos",
+                registry="local",
+                architecture="aarch64",
+                is_local=True,
+            ),
+            1,
+            agent_config={"container": {"scratch-root": scratch_root}},
+            resource_spec=KernelResourceSpec(
+                slots=ResourceSlot({"cpu": Decimal(1)}), allocations={}, scratch_disk_size=0
+            ),
+            service_ports=[],
+            data={"repl_in_port": 30000, "repl_out_port": 30001, "host_ports": [30000, 30001]},
+            environ={},
+            session_type=SessionTypes.BATCH,
+        )
+        kernel.state = KernelLifecycleStatus.RUNNING
+        return kernel
+
+    async def test_registry_survives_a_restart(self, agent: MagicMock, scratch_root: Path) -> None:
+        assert await NativeAgent._load_kernel_registry_from_recovery(agent) == {}  # first start
+
+        kernel = self._kernel(scratch_root)
+        # Not forced by the caller, and well within the writer's cool-down.
+        await NativeAgent._write_kernel_registry_to_recovery(
+            agent, {kernel.kernel_id: kernel}, KernelRegistrySaveMetadata(force=False)
+        )
+
+        restored = await NativeAgent._load_kernel_registry_from_recovery(agent)
+        restored_kernel = restored[kernel.kernel_id]
+        assert isinstance(restored_kernel, NativeKernel)
+        assert restored_kernel.session_id == kernel.session_id
+        assert restored_kernel.session_type == SessionTypes.BATCH
+        assert restored_kernel.state == KernelLifecycleStatus.RUNNING
+        assert restored_kernel["host_ports"] == [30000, 30001]
+
+    async def test_unreadable_registry_starts_empty(self, agent: MagicMock, tmp_path: Path) -> None:
+        (tmp_path / "last_registry.dat").write_bytes(b"")
+        assert await NativeAgent._load_kernel_registry_from_recovery(agent) == {}
+
+    async def test_records_map_to_containers_by_liveness(
+        self, agent: MagicMock, scratch_root: Path, live_process: psutil.Process
+    ) -> None:
+        live, _, _ = self._record(scratch_root, live_process)
+        reused_pid, _, _ = self._record(
+            scratch_root, live_process, create_time=live_process.create_time() - 3600
+        )
+        gone = subprocess.Popen(["/usr/bin/true"])
+        gone.wait()
+        gone_proc = MagicMock(pid=gone.pid, create_time=lambda: 0.0)
+        dead, _, _ = self._record(scratch_root, gone_proc)
+        self._record(scratch_root, live_process, owner_agent="i-other")
+
+        active = await NativeAgent.enumerate_containers(agent, ACTIVE_STATUS_SET)
+        every = await NativeAgent.enumerate_containers(agent, ACTIVE_STATUS_SET | DEAD_STATUS_SET)
+
+        assert [kernel_id for kernel_id, _ in active] == [live]
+        statuses = {kernel_id: container.status for kernel_id, container in every}
+        assert statuses == {
+            live: ContainerStatus.RUNNING,
+            reused_pid: ContainerStatus.EXITED,
+            dead: ContainerStatus.EXITED,
+        }
+        # The agent restores its port pool from these.
+        assert [port.host_port for port in dict(active)[live].ports] == [30000, 30001]
+
+    async def test_allocations_are_rebuilt_from_the_record(
+        self, scratch_root: Path, live_process: psutil.Process
+    ) -> None:
+        _, _, config_dir = self._record(scratch_root, live_process)
+        cpu, mem = DeviceName("cpu"), DeviceName("mem")
+        spec = KernelResourceSpec(
+            slots=ResourceSlot({"cpu": Decimal(2), "mem": Decimal(1024)}),
+            allocations={
+                cpu: {SlotName("cpu"): {DeviceId("0"): Decimal(1), DeviceId("1"): Decimal(1)}},
+                mem: {SlotName("mem"): {DeviceId("root"): Decimal(1024)}},
+            },
+            scratch_disk_size=0,
+        )
+        with (config_dir / "resource.txt").open("w") as f:
+            spec.write_to_file(f)
+        info = read_process_info(config_dir)
+        assert info is not None
+        container = info.to_container(config_dir)
+        cpu_map = DiscretePropertyAllocMap(
+            device_slots={
+                DeviceId(str(idx)): DeviceSlotInfo(SlotTypes.COUNT, SlotName("cpu"), Decimal(1))
+                for idx in range(4)
+            }
+        )
+        mem_map = DiscretePropertyAllocMap(
+            device_slots={
+                DeviceId("root"): DeviceSlotInfo(SlotTypes.BYTES, SlotName("mem"), Decimal(4096))
+            }
+        )
+
+        await DockerCPUPlugin.restore_from_container(MagicMock(), container, cpu_map)
+        await MemoryPlugin.restore_from_container(MagicMock(), container, mem_map)
+
+        assert cpu_map.allocations[SlotName("cpu")] == {
+            DeviceId("0"): Decimal(1),
+            DeviceId("1"): Decimal(1),
+            DeviceId("2"): Decimal(0),
+            DeviceId("3"): Decimal(0),
+        }
+        assert mem_map.allocations[SlotName("mem")] == {DeviceId("root"): Decimal(1024)}
+
+
+class TestLiveness:
+    """A clean that no destroy preceded means the runner died on its own."""
+
+    @pytest.fixture
+    def agent(self, tmp_path: Path) -> MagicMock:
+        agent = MagicMock(spec=NativeAgent)
+        agent._scratch_root = tmp_path
+        agent._read_process_info = partial(NativeAgent._read_process_info, agent)
+        agent._mark_exit_handled = partial(NativeAgent._mark_exit_handled, agent)
+        agent.anycast_and_broadcast_event = AsyncMock()
+        agent.collect_logs = AsyncMock()
+        return agent
+
+    @pytest.fixture
+    def dead_kernel(self, tmp_path: Path) -> tuple[KernelId, SessionId]:
+        kernel_id, session_id = KernelId(uuid4()), SessionId(uuid4())
+        config_dir = tmp_path / str(kernel_id) / "config"
+        config_dir.mkdir(parents=True)
+        gone = subprocess.Popen(["/usr/bin/true"], start_new_session=True)
+        gone.wait()
+        info = KernelProcessInfo(
+            container_id="c" * 64,
+            pid=gone.pid,
+            create_time=0.0,
+            image="local/stable/python:3.12-macos",
+            labels={LabelName.SESSION_ID.value: str(session_id)},
+            host_ports=[30000, 30001],
+            service_ports=[8080],
+        )
+        write_process_info(config_dir, info)
+        return kernel_id, session_id
+
+    async def test_death_is_reported_as_a_session_failure(
+        self, agent: MagicMock, dead_kernel: tuple[KernelId, SessionId], tmp_path: Path
+    ) -> None:
+        kernel_id, session_id = dead_kernel
+
+        await NativeAgent.clean_kernel(agent, kernel_id, None, False)
+
+        anycast_event, _ = agent.anycast_and_broadcast_event.await_args.args
+        assert isinstance(anycast_event, SessionFailureAnycastEvent)
+        assert anycast_event.session_id == UUID(str(session_id))
+        assert anycast_event.reason == KernelLifecycleEventReason.SELF_TERMINATED
+        # The record goes with the scratch dir, which ends its claim on the service ports.
+        assert not (tmp_path / str(kernel_id)).exists()
+
+    async def test_destroyed_kernel_is_not_reported(
+        self, agent: MagicMock, dead_kernel: tuple[KernelId, SessionId], tmp_path: Path
+    ) -> None:
+        kernel_id, _ = dead_kernel
+
+        await NativeAgent.destroy_kernel(agent, kernel_id, None)
+        info = read_process_info(tmp_path / str(kernel_id) / "config")
+        assert info is not None and info.exit_handled  # survives an agent restart in between
+        await NativeAgent.clean_kernel(agent, kernel_id, None, False)
+
+        agent.anycast_and_broadcast_event.assert_not_awaited()
+        assert not (tmp_path / str(kernel_id)).exists()
+
+    async def test_restarting_kernel_is_not_reported(
+        self, agent: MagicMock, dead_kernel: tuple[KernelId, SessionId], tmp_path: Path
+    ) -> None:
+        kernel_id, _ = dead_kernel
+
+        await NativeAgent.clean_kernel(agent, kernel_id, None, True)
+
+        agent.anycast_and_broadcast_event.assert_not_awaited()
+        assert (tmp_path / str(kernel_id)).exists()
+
+    async def test_death_is_reported_once(
+        self, agent: MagicMock, dead_kernel: tuple[KernelId, SessionId]
+    ) -> None:
+        kernel_id, _ = dead_kernel
+        with patch("ai.backend.agent.native.agent.shutil.rmtree"):  # a clean still in flight
+            await NativeAgent.clean_kernel(agent, kernel_id, None, False)
+            await NativeAgent.clean_kernel(agent, kernel_id, None, False)
+
+        agent.anycast_and_broadcast_event.assert_awaited_once()
