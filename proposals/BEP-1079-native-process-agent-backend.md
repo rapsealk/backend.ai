@@ -132,7 +132,7 @@ allow-compute-plugins = ["ai.backend.accelerator.metal"]
 
 - `ai.backend.agent.native` provides `NativeAgent`, `NativeKernel`, `NativeKernelCreationContext` on the existing generics.
 - The backend adds no abstract method to `AbstractAgent`, `AbstractKernel`, or `AbstractKernelCreationContext`.
-- Selecting `backend = "native"` is the opt-in to running without isolation. The agent logs a warning at startup.
+- Selecting `backend = "native"` is the opt-in to running without isolation. The agent logs it at startup.
 
 ### 4.2 Kernel process
 
@@ -156,15 +156,16 @@ Manager ──RPC──▶ NativeAgent ──spawn──▶ kernel runner (host 
 |---|---|---|
 | `BACKENDAI_KERNEL_WORK_DIR` | `/home/work` | `HOME` and working directory of user processes |
 | `BACKENDAI_KERNEL_CONFIG_DIR` | `/home/config` | Location of `environ.txt`, `intrinsic-ports.json` |
+| `BACKENDAI_KERNEL_BIND_HOST` | `*` | Bind address of the runner's ZMQ sockets; the `native` backend passes `container.bind-host` |
 
-- With both unset, the runner behaves as it does in a container today.
+- With all three unset, the runner behaves as it does in a container today.
 - On darwin, `prctl`, `/opt/kernel/*` binaries, `/opt/backend.ai`, `LD_PRELOAD`, and the sshd and ttyd intrinsic services are skipped. Their absence does not stop the runner.
 
 ### 4.4 Filesystem
 
 | Path | Content |
 |---|---|
-| `<scratch-root>/<kernel-id>/config` | Same files as in the Docker backend, plus the runner pid |
+| `<scratch-root>/<kernel-id>/config` | Same files as in the Docker backend, plus `native-kernel.json` (pid, process create time, labels, host ports) and `kernel.log` (runner output) |
 | `<scratch-root>/<kernel-id>/work` | `HOME` and working directory |
 | `work/<name>` | Symlink to the vfolder host path, at the vfolder's path relative to `/home/work` |
 
@@ -185,6 +186,8 @@ An image row supplies labels and nothing else. Nothing is pulled.
 | `ai.backend.service-ports` and the remaining labels | Same meaning as in a container |
 
 Registration in the first cut: a Docker image that carries the labels and no filesystem content, scanned through the `local` registry. `architecture` of the row is the agent's (`aarch64`).
+
+The agent does not report installed images. It checks the runtime path at kernel creation; a path that is not an executable on the host fails the creation.
 
 ### 4.6 Ports
 
@@ -211,6 +214,8 @@ Compute plugin `ai.backend.accelerator.metal`:
 
 - Device memory is the same RAM that `mem` accounts. A session holding `metal.device` and `mem` can be counted twice against physical memory.
 - Any host process can open the Metal device. `metal.device` schedules and accounts; it does not gate access.
+- The manager reports the slot once the slot type `metal.device` is registered (`fixtures/manager/example-resource-slot-types.json`, or `resource-slot slot-type create` on an existing install).
+- `[resource] allocation-order` in the agent config lists `metal`.
 
 ### 4.8 Isolation
 
@@ -234,8 +239,8 @@ Prior art for host-process engines on macOS:
 | Create | Allocate slots and ports, prepare the scratch directory and symlinks, spawn the runner, wait for its status reply |
 | Destroy | `SIGTERM` to the process group, `SIGKILL` after a grace period |
 | Clean | Release ports and slots, remove the scratch directory |
-| Liveness | By pid; a dead runner injects the same lifecycle events as a dead container |
-| Agent restart | Best-effort: kernels are matched by the pid recorded in the config directory |
+| Liveness | By pid and process create time from `native-kernel.json`; a dead runner injects the same lifecycle events as a dead container |
+| Agent restart | Kernels are found through `native-kernel.json`. The first cut terminates them; re-adoption is Open Question 7 |
 
 ## 5. Relation to Other BEPs
 
@@ -260,10 +265,12 @@ One pull request per row, stacked in this order.
 |---|---|---|
 | 1 | This BEP | Decisions and open questions recorded |
 | 2 | Kernel runner path contract (4.3) | The runner executes a batch command as a host process on macOS; container behavior unchanged |
-| 3 | `native` backend (4.1, 4.2, 4.4 – 4.6, 4.8, 4.9) | A batch session prints `Device(gpu, 0)`; termination leaves no process |
-| 4 | `metal` compute plugin (4.7) | The agent advertises `metal.device = 1` and reports GPU utilization and memory in node stats |
-| 5 | `mlx-lm` runtime variant | The variant's start command answers `/v1/chat/completions` |
-| 6 | Setup document and sample configs | Following it from a clean development install reaches the Goal |
+| 3 | `native` backend, batch session (4.1, 4.2, 4.4, 4.5, 4.8, 4.9) | A batch session prints `Device(gpu, 0)`; termination leaves no process |
+| 4 | `metal` compute plugin (4.7) | A session is created with `metal.device = 1`; the agent reports GPU utilization and memory in node stats |
+| 5 | `native` backend, service ports and inference sessions (4.6) | An inference session serves a model folder |
+| 6 | `mlx-lm` runtime variant | An inference session answers `/v1/chat/completions` from `mlx_lm.server` |
+| 7 | `native` backend, liveness sync and restart recovery (4.9) | A killed runner ends the session; an agent restart keeps a running session |
+| 8 | Setup document and sample configs | Following it from a clean development install reaches the Goal |
 
 ## Decision Log
 
@@ -273,8 +280,8 @@ One pull request per row, stacked in this order.
 | 2026-10-02 | Do not wait for BEP-1016; write the `metal` plugin on the current `AbstractComputePlugin` | The plugin needs discovery, slots, and node stats only; the Docker-shaped methods have nothing to return for a host process | Implement BEP-1016 first (Draft, no implementation, larger than this BEP) |
 | 2026-10-02 | An image row is metadata; `ai.backend.runtime-path` is a host interpreter path; registered through the `local` registry. No OS dimension in scheduling | Needs no manager change. Session creation, labels, and service ports keep working | New registry type for host environments; agent config mapping image → environment; `architecture` value `darwin-aarch64` |
 | 2026-10-02 | Slot `metal.device`, count, one device per host, memory = `recommendedMaxWorkingSetSize`; overlap with `mem` documented | Matches the `{key}.device` convention of other plugins. A count slot gives exclusive scheduling of the one GPU | Memory-based slot (`metal.mem`) deducted from `mem`; no slot (GPU unaccounted) |
-| 2026-10-02 | Reuse the kernel runner on the host through `BACKENDAI_KERNEL_WORK_DIR` and `BACKENDAI_KERNEL_CONFIG_DIR` | `execute`, services, and model services work without a second code path in the agent. The runner is Python and already reads its ports from `intrinsic-ports.json` | Run batch commands from the agent without the runner (needs an in-agent replacement for the runner protocol) |
-| 2026-10-02 | No isolation; `backend = "native"` is the opt-in; startup warning | macOS has no cgroups or namespaces; `sandbox-exec` is marked deprecated | `sandbox-exec` profile per kernel; a separate OS user per kernel; macOS guest VM per kernel (two-VM license limit) |
+| 2026-10-02 | Reuse the kernel runner on the host through `BACKENDAI_KERNEL_WORK_DIR`, `BACKENDAI_KERNEL_CONFIG_DIR`, and `BACKENDAI_KERNEL_BIND_HOST` | `execute`, services, and model services work without a second code path in the agent. The runner is Python and already reads its ports from `intrinsic-ports.json` | Run batch commands from the agent without the runner (needs an in-agent replacement for the runner protocol) |
+| 2026-10-02 | No isolation; `backend = "native"` is the opt-in; stated in the startup log | macOS has no cgroups or namespaces; `sandbox-exec` is marked deprecated | `sandbox-exec` profile per kernel; a separate OS user per kernel; macOS guest VM per kernel (two-VM license limit) |
 | 2026-10-02 | Backend name `native` | BEP-1016 names the workload "(native) process tree"; the backend is not macOS-specific | `process`, `macos`, `host` |
 | 2026-10-02 | Service host port equals the declared port | No NAT exists for a host process. Precedent in the Docker host-network branch | Remap every service port through the port pool (the runner and service definitions take declared ports) |
 
