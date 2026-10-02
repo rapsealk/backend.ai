@@ -17,6 +17,8 @@
 - Always check the abstract base classes in `agent/` before implementing.
 - The Dummy implementation must be updated together with Docker/Kubernetes changes.
 - Put new infrastructure-specific code in the corresponding sub-directory (`agent/docker/`, `agent/kubernetes/`, `agent/dummy/`, `agent/native/`).
+- In `agent/native/`, find, signal and clean a kernel through its `native-kernel.json` record — not through the in-memory kernel object.
+- Do NOT call Docker or cgroup APIs from `agent/native/`.
 
 ## Manager communication
 

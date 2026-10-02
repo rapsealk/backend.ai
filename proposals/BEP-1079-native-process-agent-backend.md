@@ -14,21 +14,25 @@ detail-docs: []
 key-constraints:
   - No isolation and no resource enforcement; single-tenant development agents only
   - Built on the existing AbstractAgent / AbstractKernel / AbstractKernelCreationContext generics; all backend-specific code stays in agent/native/
-  - Container behavior of the kernel runner is unchanged when the two path variables are unset
+  - Container behavior of the kernel runner is unchanged when its three variables are unset
   - No manager or scheduler change in the first cut
 key-decisions:
   - Backend name `native` (AgentBackend.NATIVE), not built on BEP-1057 ComputeBackend yet
-  - The kernel runner is reused on the host through BACKENDAI_KERNEL_WORK_DIR and BACKENDAI_KERNEL_CONFIG_DIR
+  - The kernel runner is reused on the host through BACKENDAI_KERNEL_WORK_DIR, BACKENDAI_KERNEL_CONFIG_DIR and BACKENDAI_KERNEL_BIND_HOST
+  - Kernel paths map to the scratch directory by symlink; the declared service port is the host port
+  - Running kernels are re-adopted after an agent restart
+  - Serving runtime variant is mlx-lm; mlxcel v0.7.0 is deferred
   - An image row is metadata only; ai.backend.runtime-path is a host interpreter path
   - Slot `metal.device` (count, one device per host); overlap with `mem` is documented, not solved
-phases: 6
+phases: 8
 -->
 
 # Native Process Agent Backend
 
 ## Related Issues
 
-- Epic: rapsealk/backend.ai#1 (sub-issues #2 – #7)
+- Epics: rapsealk/backend.ai#1, rapsealk/backend.ai#8 (sub-issues #2 – #7, #9, #10)
+- Serving runtime evaluation: rapsealk/backend.ai#21
 - Consumer: lablup/backend.ai-fasttrack#6041
 - Related BEPs: [BEP-1002](BEP-1002-agent-architecture.md), [BEP-1016](BEP-1016-accelerator-interface-v2.md), [BEP-1057](BEP-1057-agent-re-architecture.md)
 
@@ -41,7 +45,7 @@ This BEP defines:
 | Item | Content |
 |---|---|
 | Agent backend `native` | A kernel is a host process tree, not a container |
-| Kernel runner path contract | Two environment variables that let `ai.backend.kernel` run outside a container |
+| Kernel runner path contract | Three environment variables that let `ai.backend.kernel` run outside a container |
 | Compute plugin `metal` | The Apple GPU as the slot `metal.device` |
 
 Out of scope:
@@ -117,7 +121,7 @@ Per area, **✅ exists / ➕ to add**.
 
 | | Item |
 |---|---|
-| ✅ | Runtime variants `vllm`, `nim`, `cmd`, `custom`, `huggingface-tgi`, `sglang`, `modular-max` |
+| ✅ | Runtime variants `vllm`, `nim`, `cmd`, `custom`, `huggingface-tgi`, `sglang`, `modular-max`, `llama-cpp` |
 | ➕ | Runtime variant `mlx-lm` that starts `mlx_lm.server` |
 
 ## 4. Proposed Design
@@ -146,7 +150,7 @@ Manager ──RPC──▶ NativeAgent ──spawn──▶ kernel runner (host 
 |---|---|
 | Command | `sys.executable -s -m ai.backend.kernel <runtime-type> <runtime-path>`, the agent's own interpreter |
 | Process session | The runner starts in a new process session; every user process belongs to its process group |
-| Agent ↔ runner | ZMQ over host ports taken from the agent port pool, written to `intrinsic-ports.json` as `replin` / `replout` |
+| Agent ↔ runner | ZMQ over host ports taken from the agent port pool, written to `intrinsic-ports.json` as `replin` / `replout`. The runner binds them on the loopback and the agent connects there |
 | OS user | The agent's OS user |
 | RPC surface | Unchanged: `execute`, `start_service`, `start_model_service` go through the runner as in a container |
 
@@ -156,18 +160,30 @@ Manager ──RPC──▶ NativeAgent ──spawn──▶ kernel runner (host 
 |---|---|---|
 | `BACKENDAI_KERNEL_WORK_DIR` | `/home/work` | `HOME` and working directory of user processes |
 | `BACKENDAI_KERNEL_CONFIG_DIR` | `/home/config` | Location of `environ.txt`, `intrinsic-ports.json` |
-| `BACKENDAI_KERNEL_BIND_HOST` | `*` | Bind address of the runner's ZMQ sockets; the `native` backend passes `container.bind-host` |
+| `BACKENDAI_KERNEL_BIND_HOST` | `*` | Bind address of the runner's ZMQ sockets; the `native` backend passes `127.0.0.1` |
 
 - With all three unset, the runner behaves as it does in a container today.
 - On darwin, `prctl`, `/opt/kernel/*` binaries, `/opt/backend.ai`, `LD_PRELOAD`, and the sshd and ttyd intrinsic services are skipped. Their absence does not stop the runner.
 
 ### 4.4 Filesystem
 
-| Path | Content |
+| Kernel path | Host path |
 |---|---|
-| `<scratch-root>/<kernel-id>/config` | Same files as in the Docker backend, plus `native-kernel.json` (pid, process create time, labels, host ports) and `kernel.log` (runner output) |
-| `<scratch-root>/<kernel-id>/work` | `HOME` and working directory |
-| `work/<name>` | Symlink to the vfolder host path, at the vfolder's path relative to `/home/work` |
+| `/home/work` | `<scratch-root>/<kernel-id>/work`, the `HOME` and working directory |
+| `/home/work/<path>` | `<scratch-root>/<kernel-id>/work/<path>` |
+| Any other `/<path>` | `<scratch-root>/<kernel-id>/mounts/<path>` |
+| `/home/config` | `<scratch-root>/<kernel-id>/config` |
+
+- A mount is a symlink at the mapped path to the vfolder host path. `/` and `/home/work` are refused as mount targets.
+- For an inference session, `model_path`, that path inside the start command, and `BACKEND_MODEL_PATH` are rewritten to the host path. `pre_start_actions` arguments are not.
+
+Files the backend adds:
+
+| File | Content |
+|---|---|
+| `config/native-kernel.json` | pid, process create time, labels, REPL ports, declared service ports, `exit_handled` |
+| `config/kernel.log` | Output of the runner and the user processes |
+| `<var-base-path>/last_registry.<agent-id>.dat` | The agent's kernel registry |
 
 Limits:
 
@@ -192,7 +208,8 @@ The agent does not report installed images. It checks the runtime path at kernel
 ### 4.6 Ports
 
 - No NAT. The host port of a service equals the port the image label, the preopen list, or the model definition declares.
-- A port already in use fails kernel creation.
+- Kernel creation fails with `PortConflictError` when another kernel's `native-kernel.json` declares the port, or a listener answers on it on the loopback.
+- `sshd` and `ttyd` are not advertised: their binaries exist only in a container.
 - Precedent: the host-network branch in `agent/docker/intrinsic.py` that writes `intrinsic-ports.json`.
 
 ### 4.7 Resources and the `metal.device` slot
@@ -237,10 +254,11 @@ Prior art for host-process engines on macOS:
 | Event | Behavior |
 |---|---|
 | Create | Allocate slots and ports, prepare the scratch directory and symlinks, spawn the runner, wait for its status reply |
-| Destroy | `SIGTERM` to the process group, `SIGKILL` after a grace period |
+| Destroy | `SIGTERM` to the process group, `SIGKILL` after 10 s |
 | Clean | Release ports and slots, remove the scratch directory |
-| Liveness | By pid and process create time from `native-kernel.json`; a dead runner injects the same lifecycle events as a dead container |
-| Agent restart | Kernels are found through `native-kernel.json`. The first cut terminates them; re-adoption is Open Question 7 |
+| Liveness | By pid and process create time from `native-kernel.json`. A runner that died without a destroy ends the session with result `FAILURE` and reason `self-terminated` |
+| Agent stop | Kernels keep running |
+| Agent restart | Running kernels are re-adopted: registry entry, slot allocations, ports, code runner. A kernel that died meanwhile is cleaned and its session fails with `self-terminated`. With a missing or unreadable registry file, running kernels are terminated |
 
 ## 5. Relation to Other BEPs
 
@@ -253,24 +271,25 @@ Prior art for host-process engines on macOS:
 ## 6. Migration / Compatibility
 
 - No change for `docker`, `kubernetes`, `dummy` agents.
-- The kernel runner in a container reads no new required input; both variables default to the current paths.
+- The kernel runner in a container reads no new required input; the three variables default to the current behavior.
+- The kernel runner's shutdown waits at most 1 s for its tasks, in a container as well.
 - No manager, scheduler, or DB schema change. The `mlx-lm` runtime variant is an additive seed.
 - No RPC contract change between manager and agent.
 
 ## 7. Implementation Plan
 
-One pull request per row, stacked in this order.
+One pull request per row, stacked in this order. All eight are implemented.
 
-| # | Work | Done when |
+| # | Work | Verified by |
 |---|---|---|
-| 1 | This BEP | Decisions and open questions recorded |
-| 2 | Kernel runner path contract (4.3) | The runner executes a batch command as a host process on macOS; container behavior unchanged |
+| 1 | This BEP | — |
+| 2 | Kernel runner path contract (4.3) | The runner executes a batch command as a host process on macOS |
 | 3 | `native` backend, batch session (4.1, 4.2, 4.4, 4.5, 4.8, 4.9) | A batch session prints `Device(gpu, 0)`; termination leaves no process |
 | 4 | `metal` compute plugin (4.7) | A session is created with `metal.device = 1`; the agent reports GPU utilization and memory in node stats |
-| 5 | `native` backend, service ports and inference sessions (4.6) | An inference session serves a model folder |
-| 6 | `mlx-lm` runtime variant | An inference session answers `/v1/chat/completions` from `mlx_lm.server` |
-| 7 | `native` backend, liveness sync and restart recovery (4.9) | A killed runner ends the session; an agent restart keeps a running session |
-| 8 | Setup document and sample configs | Following it from a clean development install reaches the Goal |
+| 5 | `native` backend, service ports and inference sessions (4.4, 4.6) | An inference session serves a model folder through the deployment endpoint |
+| 6 | `mlx-lm` runtime variant | A deployment answers `/v1/chat/completions` from `mlx_lm.server` on Metal |
+| 7 | `native` backend, liveness and restart recovery (4.9) | A killed runner fails the session; a deployment keeps answering across an agent restart |
+| 8 | Setup document and sample configs (`docs/agent/native.rst`) | Following it reaches the Goal |
 
 ## Decision Log
 
@@ -284,6 +303,10 @@ One pull request per row, stacked in this order.
 | 2026-10-02 | No isolation; `backend = "native"` is the opt-in; stated in the startup log | macOS has no cgroups or namespaces; `sandbox-exec` is marked deprecated | `sandbox-exec` profile per kernel; a separate OS user per kernel; macOS guest VM per kernel (two-VM license limit) |
 | 2026-10-02 | Backend name `native` | BEP-1016 names the workload "(native) process tree"; the backend is not macOS-specific | `process`, `macos`, `host` |
 | 2026-10-02 | Service host port equals the declared port | No NAT exists for a host process. Precedent in the Docker host-network branch | Remap every service port through the port pool (the runner and service definitions take declared ports) |
+| 2026-10-02 | A mount outside `/home/work` maps to `<scratch-root>/<kernel-id>/mounts/<path>`; the model path of an inference session is rewritten to it | Model vfolders mount at `/models`; refusing such mounts blocked inference sessions | Refuse mounts outside `/home/work`; require `mount_destination` under `/home/work` |
+| 2026-10-03 | A runner that dies without a destroy fails the session with `self-terminated`, decided by `exit_handled` in `native-kernel.json` | Without a result event the manager ends the session as if it had finished. The flag on disk also covers a death while the agent is down | Decide by exit code (the agent is not the parent of a re-adopted runner) |
+| 2026-10-03 | Running kernels are re-adopted after an agent restart, through the pickle registry file | The records on disk already hold ports and allocations, and the base agent restores from them once the registry loads. A deployment keeps answering across the restart | Terminate leftovers (first cut); rebuild the registry from the records alone |
+| 2026-10-03 | Serving runtime variant is `mlx-lm`; `mlxcel` v0.7.0 is not added | rapsealk/backend.ai#21: `mlxcel-server` v0.7.0 returns different greedy output under its default flags and aborts on prompt-cache reuse; it has no training command and no CPU-only Linux build. Revisit when the defect is fixed in a release | `mlxcel` as the variant; both variants |
 
 ## Open Questions
 
@@ -295,7 +318,7 @@ One pull request per row, stacked in this order.
 | 4 | **Migration to `ComputeBackend`.** When BEP-1057 Phase 1 migrates Docker, whether `InstanceSpec.image` stays mandatory for a process tree, and how `InstanceAttachments.mounts` maps to symlinks |
 | 5 | **Per-kernel stats.** No cgroup exists. Options: sum over the process tree, or node stats only. Per-process GPU utilization has no public API |
 | 6 | **Enforcement.** Whether `mem` is enforced at all (MLX `set_memory_limit` is cooperative; `setrlimit` covers the process, not the GPU working set) |
-| 7 | **Restart recovery.** Whether a kernel that outlives an agent restart is re-adopted or terminated |
+| 7 | **Registry persistence.** Re-adoption depends on the pickle registry file, which BEP-1002 plans to remove. Whether the records in `native-kernel.json` alone can rebuild the registry |
 | 8 | **Linux hosts.** Whether `native` is supported on Linux, where containers already reach the GPU |
 
 ## References

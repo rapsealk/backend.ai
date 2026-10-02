@@ -150,6 +150,7 @@ agent/
 ├── docker/              # Docker container backend
 │   ├── agent.py        # Docker-specific agent implementation
 │   └── resources.py    # Docker resource management
+├── native/              # Host-process backend (no container)
 ├── watcher/             # Agent watcher
 ├── plugin/              # Plugin system
 ├── observer/            # Metrics observers
@@ -178,6 +179,7 @@ Kernels represent running containers executing computing sessions:
 ### Container Backend
 The Agent supports multiple container runtimes:
 - **Docker**: Standard Docker containers
+- **Native**: Kernels as host process trees, for Metal on macOS (`docs/agent/native.rst`)
 
 The Docker backend implements these interfaces:
 - `create_kernel()`: Create new container
