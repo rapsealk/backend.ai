@@ -2386,6 +2386,7 @@ MODEL_SERVICE_RUNTIME_PROFILES: Mapping[str, ModelServiceProfile] = {
     "modular-max": ModelServiceProfile(
         name="Modular MAX", health_check_endpoint="/health", port=8000
     ),
+    "mlx-lm": ModelServiceProfile(name="MLX LM", health_check_endpoint="/health", port=8080),
     "cmd": ModelServiceProfile(name="Predefined Image Command"),
 }
 

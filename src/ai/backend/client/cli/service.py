@@ -278,7 +278,7 @@ def info(ctx: CLIContext, service_name_or_id: str) -> None:
     "--runtime-variant",
     metavar="RUNTIME_VARIANT",
     type=click.Choice(
-        ["custom", "vllm", "nim", "huggingface-tgi", "sglang", "modular-max", "cmd"],
+        ["custom", "vllm", "nim", "huggingface-tgi", "sglang", "modular-max", "mlx-lm", "cmd"],
         case_sensitive=False,
     ),
     default="custom",
