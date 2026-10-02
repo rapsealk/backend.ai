@@ -31,8 +31,8 @@ phases: 8
 
 ## Related Issues
 
-- Epics: rapsealk/backend.ai#1, rapsealk/backend.ai#8 (sub-issues #2 – #7, #9, #10)
-- Serving runtime evaluation: rapsealk/backend.ai#21
+- Epics: rapsealk/backend.ai-metal#1, rapsealk/backend.ai-metal#8 (sub-issues #2 – #7, #9, #10)
+- Serving runtime evaluation: rapsealk/backend.ai-metal#21
 - Consumer: lablup/backend.ai-fasttrack#6041
 - Related BEPs: [BEP-1002](BEP-1002-agent-architecture.md), [BEP-1016](BEP-1016-accelerator-interface-v2.md), [BEP-1057](BEP-1057-agent-re-architecture.md)
 
@@ -306,7 +306,7 @@ One pull request per row, stacked in this order. All eight are implemented.
 | 2026-10-02 | A mount outside `/home/work` maps to `<scratch-root>/<kernel-id>/mounts/<path>`; the model path of an inference session is rewritten to it | Model vfolders mount at `/models`; refusing such mounts blocked inference sessions | Refuse mounts outside `/home/work`; require `mount_destination` under `/home/work` |
 | 2026-10-03 | A runner that dies without a destroy fails the session with `self-terminated`, decided by `exit_handled` in `native-kernel.json` | Without a result event the manager ends the session as if it had finished. The flag on disk also covers a death while the agent is down | Decide by exit code (the agent is not the parent of a re-adopted runner) |
 | 2026-10-03 | Running kernels are re-adopted after an agent restart, through the pickle registry file | The records on disk already hold ports and allocations, and the base agent restores from them once the registry loads. A deployment keeps answering across the restart | Terminate leftovers (first cut); rebuild the registry from the records alone |
-| 2026-10-03 | Serving runtime variant is `mlx-lm`; `mlxcel` v0.7.0 is not added | rapsealk/backend.ai#21: `mlxcel-server` v0.7.0 returns different greedy output under its default flags and aborts on prompt-cache reuse; it has no training command and no CPU-only Linux build. Revisit when the defect is fixed in a release | `mlxcel` as the variant; both variants |
+| 2026-10-03 | Serving runtime variant is `mlx-lm`; `mlxcel` v0.7.0 is not added | rapsealk/backend.ai-metal#21: `mlxcel-server` v0.7.0 returns different greedy output under its default flags and aborts on prompt-cache reuse; it has no training command and no CPU-only Linux build. Revisit when the defect is fixed in a release | `mlxcel` as the variant; both variants |
 
 ## Open Questions
 
