@@ -29,6 +29,11 @@ DEFAULT_MODEL_DEFINITION: Final[dict[str, Any]] = {
         {
             "name": "mlx-lm-model",
             "service": {
+                # GET /v1/models returns an empty 200 without the hub cache directory
+                # (ml-explore/mlx-lm#1636); the path is relative to the kernel home.
+                "pre_start_actions": [
+                    {"action": "mkdir", "args": {"path": ".cache/huggingface/hub"}},
+                ],
                 "start_command": (
                     "python -m mlx_lm server --model '{model_path}' --host 0.0.0.0 --port 8080"
                 ),
