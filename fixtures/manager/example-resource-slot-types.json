@@ -209,6 +209,21 @@
         "round_length": 0
       },
       "rank": 1400
+    },
+    {
+      "uuid": "0d955270-a086-452b-bc73-6023f0cf9273",
+      "slot_name": "metal.device",
+      "slot_type": "count",
+      "required": false,
+      "display_name": "Apple GPU",
+      "description": "Apple Silicon GPU (Metal)",
+      "display_unit": "GPU",
+      "display_icon": "gpu",
+      "number_format": {
+        "binary": false,
+        "round_length": 0
+      },
+      "rank": 1500
     }
   ]
 }
