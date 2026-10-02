@@ -584,7 +584,9 @@ class CommonAgentConfig(BaseConfigSchema):
                 "container orchestration infrastructure. Available options: "
                 "'docker' uses Docker daemon for container management (default for most deployments); "
                 "'kubernetes' uses Kubernetes API for container management in K8s clusters; "
-                "'dummy' is a mock backend for testing without actual containers."
+                "'dummy' is a mock backend for testing without actual containers; "
+                "'native' runs each kernel as a host process tree without isolation "
+                "(single-tenant development agents only)."
             ),
             added_version="25.12.0",
             example=ConfigExample(local="docker", prod="docker"),
@@ -2351,7 +2353,7 @@ class AgentSpecificConfig(BaseConfigSchema):
                 self.container.validate_kubernetes_nfs()
             case AgentBackend.DOCKER:
                 DockerExtraConfig.model_validate(self.container.model_dump())
-            case AgentBackend.DUMMY:
+            case AgentBackend.DUMMY | AgentBackend.NATIVE:
                 pass
 
 
