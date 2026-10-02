@@ -33,6 +33,8 @@ class KernelProcessInfo(BaseModel):
     labels: dict[str, str]
     host_ports: list[int]
     service_ports: list[int] = []  # declared by the kernel; they are host ports as they are
+    # Set once the agent ended the kernel or reported its death; a clean without it is a death.
+    exit_handled: bool = False
 
     def _is_leader(self, proc: psutil.Process) -> bool:
         return abs(proc.create_time() - self.create_time) < _CREATE_TIME_TOLERANCE
@@ -97,7 +99,10 @@ def read_process_info(config_dir: Path) -> KernelProcessInfo | None:
 
 
 def write_process_info(config_dir: Path, info: KernelProcessInfo) -> None:
-    (config_dir / PROCESS_INFO_FILENAME).write_text(info.model_dump_json())
+    # Replaced atomically: a kernel with a truncated record could not be found again.
+    tmp_path = config_dir / f"{PROCESS_INFO_FILENAME}.tmp"
+    tmp_path.write_text(info.model_dump_json())
+    tmp_path.replace(config_dir / PROCESS_INFO_FILENAME)
 
 
 def _is_listening(port: int) -> bool:

@@ -16,6 +16,7 @@ from importlib.resources import files
 from io import StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Final, override
+from uuid import UUID
 
 import psutil
 
@@ -37,6 +38,12 @@ from ai.backend.agent.errors.backend import (
     UnsupportedBackendOperationError,
 )
 from ai.backend.agent.kernel import AbstractKernel
+from ai.backend.agent.kernel_registry.exception import (
+    KernelRegistryLoadError,
+    KernelRegistryNotFound,
+)
+from ai.backend.agent.kernel_registry.loader.pickle import PickleBasedKernelRegistryLoader
+from ai.backend.agent.kernel_registry.writer.pickle import PickleBasedKernelRegistryWriter
 from ai.backend.agent.kernel_registry.writer.types import KernelRegistrySaveMetadata
 from ai.backend.agent.port_pool import PortPool
 from ai.backend.agent.resources import (
@@ -53,6 +60,9 @@ from ai.backend.common.docker import ImageRef, LabelName
 from ai.backend.common.dto.agent.response import PurgeImagesResp
 from ai.backend.common.dto.manager.rpc_request import PurgeImagesReq
 from ai.backend.common.events.dispatcher import EventProducer
+from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEventReason
+from ai.backend.common.events.event_types.session.anycast import SessionFailureAnycastEvent
+from ai.backend.common.events.event_types.session.broadcast import SessionFailureBroadcastEvent
 from ai.backend.common.json import dump_json
 from ai.backend.common.types import (
     AutoPullBehavior,
@@ -71,6 +81,7 @@ from ai.backend.common.types import (
     ResourceSlot,
     Sentinel,
     ServicePort,
+    SessionId,
     SlotName,
     current_resource_slots,
 )
@@ -465,10 +476,19 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
 
 class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
     _service_port_lock: asyncio.Lock
+    _registry_loader: PickleBasedKernelRegistryLoader
+    _registry_writer: PickleBasedKernelRegistryWriter
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._service_port_lock = asyncio.Lock()
+        agent_config = self.local_config.agent
+        registry_file_name = f"last_registry.{self.id}.dat"
+        registry_file_path = agent_config.var_base_path / registry_file_name
+        self._registry_loader = PickleBasedKernelRegistryLoader(
+            registry_file_path, agent_config.ipc_base_path / registry_file_name
+        )
+        self._registry_writer = PickleBasedKernelRegistryWriter(registry_file_path)
 
     @override
     async def __ainit__(self) -> None:
@@ -489,7 +509,11 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
 
     @override
     async def _load_kernel_registry_from_recovery(self) -> MutableMapping[KernelId, AbstractKernel]:
-        return {}
+        try:
+            return await self._registry_loader.load_kernel_registry()
+        except (KernelRegistryNotFound, KernelRegistryLoadError):
+            # First start, or an unreadable file: kernels still running get terminated.
+            return {}
 
     @override
     async def _write_kernel_registry_to_recovery(
@@ -497,7 +521,10 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
         kernel_registry: MutableMapping[KernelId, AbstractKernel],
         metadata: KernelRegistrySaveMetadata,
     ) -> None:
-        pass
+        # Always forced: a kernel missing from the file is killed at the next agent start.
+        await self._registry_writer.save_kernel_registry(
+            kernel_registry, KernelRegistrySaveMetadata(force=True)
+        )
 
     @override
     async def enumerate_containers(
@@ -603,7 +630,14 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
     ) -> None:
         info = await self._read_process_info(kernel_id)
         if info is not None:
+            await self._mark_exit_handled(kernel_id, info)
             await terminate_process_group(info, _TERMINATION_GRACE_PERIOD)
+
+    async def _mark_exit_handled(self, kernel_id: KernelId, info: KernelProcessInfo) -> None:
+        info.exit_handled = True
+        await run_in_executor_with_context(
+            None, write_process_info, config_dir_of(self._scratch_root, kernel_id), info
+        )
 
     @override
     async def clean_kernel(
@@ -614,6 +648,16 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
     ) -> None:
         config_dir = config_dir_of(self._scratch_root, kernel_id)
         info = await self._read_process_info(kernel_id)
+        if info is not None and not info.exit_handled and not restarting:
+            # No destroy preceded this clean: the runner died on its own. Without a result
+            # event the manager would end the session with its result undefined.
+            await self._mark_exit_handled(kernel_id, info)
+            session_id = SessionId(UUID(info.labels[LabelName.SESSION_ID]))
+            reason = KernelLifecycleEventReason.SELF_TERMINATED
+            await self.anycast_and_broadcast_event(
+                SessionFailureAnycastEvent(session_id=session_id, reason=reason),
+                SessionFailureBroadcastEvent(session_id=session_id, reason=reason),
+            )
         if info is not None:
             # Children may outlive a runner that died on its own.
             await terminate_process_group(info, _TERMINATION_GRACE_PERIOD)
