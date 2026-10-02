@@ -22,6 +22,8 @@ def setproctitle(title: str) -> None:
     # We don't need a portable implementation, so here is a Linux-only version
     libc_path = ctypes.util.find_library("c")
     libc = ctypes.CDLL(libc_path)
+    if not hasattr(libc, "prctl"):  # not Linux; argv[0] is already overridden by the re-exec
+        return
     PR_SET_NAME = 15
     raw_title = ctypes.c_char_p(title.encode())
     libc.prctl(PR_SET_NAME, raw_title)

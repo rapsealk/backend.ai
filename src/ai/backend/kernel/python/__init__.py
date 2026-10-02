@@ -11,6 +11,7 @@ import janus
 
 from ai.backend.kernel import BaseRunner
 from ai.backend.kernel.base import promote_path
+from ai.backend.kernel.utils import get_work_dir
 
 if TYPE_CHECKING:
     from janus import _AsyncQueueProxy
@@ -133,14 +134,15 @@ class Runner(BaseRunner):
                 "digits",
             ], {}
         if service_info["name"] == "tensorboard":
-            Path("/home/work/logs").mkdir(parents=True, exist_ok=True)
+            logdir = get_work_dir() / "logs"
+            logdir.mkdir(parents=True, exist_ok=True)
             port_str = str(service_info["port"])
             return [
                 str(self.runtime_path),
                 "-m",
                 "tensorboard.main",
                 "--logdir",
-                "/home/work/logs",
+                str(logdir),
                 "--host",
                 "0.0.0.0",
                 "--port",
@@ -157,7 +159,7 @@ class Runner(BaseRunner):
                     "8000",
                 ],
                 {},
-                "/home/work/spectravis",
+                str(get_work_dir() / "spectravis"),
             )
         if service_info["name"] == "sftp":
             port_str = str(service_info["port"])

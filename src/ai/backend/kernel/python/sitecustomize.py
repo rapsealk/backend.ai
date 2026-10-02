@@ -2,7 +2,7 @@ import os
 import socket
 import sys
 
-socket_path = "/tmp/bai-user-input.sock"
+socket_path = os.environ.get("_BACKEND_USER_INPUT_SOCK", "/tmp/bai-user-input.sock")
 
 batch_enabled = int(os.environ.get("_BACKEND_BATCH_MODE", "0"))
 if batch_enabled:
@@ -16,7 +16,7 @@ if batch_enabled:
             sys.stdout.flush()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 try:
-                    sock.connect("/tmp/bai-user-input.sock")
+                    sock.connect(socket_path)
                     userdata = sock.recv(1024)
                 except ConnectionRefusedError:
                     userdata = b"<user-input-unavailable>"
@@ -37,7 +37,7 @@ if batch_enabled:
             sock: socket.socket | None = None
             try:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.connect("/tmp/bai-user-input.sock")
+                sock.connect(socket_path)
                 userdata = sock.recv(1024)
             except OSError:
                 userdata = b"<user-input-unavailable>"
