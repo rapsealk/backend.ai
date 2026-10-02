@@ -22,6 +22,12 @@ allocation-order = ["metal", "cpu", "mem"]
 
 `allocation-order` must list `metal`; kernel creation fails for a slot whose device name is missing from it.
 
+The manager only reports slots whose type is registered. `fixtures/manager/example-resource-slot-types.json` carries `metal.device`; on an existing install register it once:
+
+```bash
+./bai resource-slot slot-type create metal.device count --display-name "Apple GPU" --display-unit GPU
+```
+
 ## Limits
 
 - A Linux container cannot use Metal. Under the Docker backend the plugin only advertises and accounts the slot.
