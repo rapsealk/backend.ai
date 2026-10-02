@@ -321,8 +321,8 @@ class BaseRunner(metaclass=ABCMeta):
             log.info("shutting down...")
             self._run_task.cancel()
             self._main_task.cancel()
-            await self._run_task
-            await self._main_task
+            # Their last sends never return once the agent has detached from outsock.
+            await asyncio.wait([self._run_task, self._main_task], timeout=1.0)
             if health_check_task := self._health_check_task:
                 health_check_task.cancel()
                 await health_check_task
