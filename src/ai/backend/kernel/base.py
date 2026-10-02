@@ -44,7 +44,13 @@ from .intrinsic import (
 from .jupyter_client import aexecute_interactive
 from .logging import BraceStyleAdapter, setup_logger, setup_logger_basic
 from .service import ServiceParser
-from .utils import TracebackSourceFilter, scan_proc_stats, wait_local_port_open
+from .utils import (
+    TracebackSourceFilter,
+    get_config_dir,
+    get_work_dir,
+    scan_proc_stats,
+    wait_local_port_open,
+)
 
 logger = logging.getLogger()
 logger.addFilter(TracebackSourceFilter(str(Path(__file__).parent)))
@@ -53,6 +59,10 @@ log = BraceStyleAdapter(logger)
 TReturn = TypeVar("TReturn")
 
 DEFAULT_SERVICE_LAUNCH_TIMEOUT_SEC = 30.0
+
+# The agent mounts these into a container; a runner started as a host process has neither.
+DROPBEAR_PATH = Path("/opt/kernel/dropbearmulti")
+TTYD_PATH = Path("/opt/kernel/ttyd")
 
 
 class FailureSentinel(enum.Enum):
@@ -162,6 +172,9 @@ class BaseRunner(metaclass=ABCMeta):
     runtime_path: Path
 
     services_running: dict[str, asyncio.subprocess.Process]
+    work_dir: Path
+    config_dir: Path
+    user_input_sock_path: str
 
     intrinsic_host_ports_mapping: Mapping[str, int]
 
@@ -180,15 +193,26 @@ class BaseRunner(metaclass=ABCMeta):
         self.subproc = None
         self._background_tasks = set()
         self.runtime_path = runtime_path
-        self.child_env = {**os.environ, **self.default_child_env}
+        self.work_dir = get_work_dir()
+        self.config_dir = get_config_dir()
+        self.user_input_sock_path = "/tmp/bai-user-input.sock"
+        if "BACKENDAI_KERNEL_WORK_DIR" in os.environ:
+            # A host process: there is no container to set the cwd or to keep /tmp private.
+            os.chdir(self.work_dir)
+            self.user_input_sock_path = f"/tmp/bai-user-input.{os.getpid()}.sock"
+        self.child_env = {
+            **os.environ,
+            **self.default_child_env,
+            "HOME": str(self.work_dir),
+            "_BACKEND_USER_INPUT_SOCK": self.user_input_sock_path,
+        }
         # set some defaults only when they are missing from the image
         if "PATH" not in self.child_env:
             self.child_env["PATH"] = self.default_child_env_path
         if "SHELL" not in self.child_env:
             self.child_env["SHELL"] = self.default_child_env_shell
-        config_dir = Path("/home/config")
         try:
-            evdata = (config_dir / "environ.txt").read_text()
+            evdata = (self.config_dir / "environ.txt").read_text()
             for line in evdata.splitlines():
                 k, v = line.split("=", 1)
                 self.child_env[k] = v
@@ -196,9 +220,9 @@ class BaseRunner(metaclass=ABCMeta):
         except FileNotFoundError:
             pass
         except Exception:
-            log.exception("Reading /home/config/environ.txt failed!")
+            log.exception("Reading {} failed!", self.config_dir / "environ.txt")
 
-        work_dir = Path("/home/work")
+        work_dir = self.work_dir
         work_dir_owner = work_dir.stat().st_uid
         process_owner = os.getuid()
         if work_dir_owner != process_owner:
@@ -216,7 +240,7 @@ class BaseRunner(metaclass=ABCMeta):
             path_env = promote_path(path_env, "/usr/local/nvidia/bin")
         if Path("/home/linuxbrew/.linuxbrew").is_dir():
             path_env = promote_path(path_env, "/home/linuxbrew/.linuxbrew/bin")
-        path_env = promote_path(path_env, "/home/work/.local/bin")
+        path_env = promote_path(path_env, work_dir / ".local/bin")
         self.child_env["PATH"] = path_env
 
         self.started_at: float = time.monotonic()
@@ -248,7 +272,7 @@ class BaseRunner(metaclass=ABCMeta):
 
         self.zctx = zmq.asyncio.Context()
 
-        intrinsic_host_ports_mapping_path = Path("/home/config/intrinsic-ports.json")
+        intrinsic_host_ports_mapping_path = self.config_dir / "intrinsic-ports.json"
         if intrinsic_host_ports_mapping_path.is_file():
             intrinsic_host_ports_mapping = json.loads(
                 await asyncio.get_running_loop().run_in_executor(
@@ -260,12 +284,17 @@ class BaseRunner(metaclass=ABCMeta):
 
         insock_port = self.intrinsic_host_ports_mapping.get("replin", "2000")
         outsock_port = self.intrinsic_host_ports_mapping.get("replout", "2001")
+        # A container publishes these ports through the agent; a host process must not
+        # expose them on every interface, so the agent narrows the bind address.
+        bind_host = os.environ.get("BACKENDAI_KERNEL_BIND_HOST", "*")
         self.insock = self.zctx.socket(zmq.PULL)
-        self.insock.bind(f"tcp://*:{insock_port}")
-        log.debug("binding the kernel-runner inbound socket to tcp://*:{}", insock_port)
+        self.insock.bind(f"tcp://{bind_host}:{insock_port}")
+        log.debug("binding the kernel-runner inbound socket to tcp://{}:{}", bind_host, insock_port)
         self.outsock = self.zctx.socket(zmq.PUSH)
-        self.outsock.bind(f"tcp://*:{outsock_port}")
-        log.debug("binding the kernel-runner outbound socket to tcp://*:{}", outsock_port)
+        self.outsock.bind(f"tcp://{bind_host}:{outsock_port}")
+        log.debug(
+            "binding the kernel-runner outbound socket to tcp://{}:{}", bind_host, outsock_port
+        )
 
         self.log_queue = janus.Queue()
         self.task_queue = asyncio.Queue()
@@ -325,7 +354,7 @@ class BaseRunner(metaclass=ABCMeta):
         # Make inline backend defaults in Matplotlib.
         self.kernel_mgr = None
         try:
-            kconfigdir = Path("/home/work/.ipython/profile_default/")
+            kconfigdir = self.work_dir / ".ipython/profile_default"
             kconfigdir.mkdir(parents=True, exist_ok=True)
             kconfig_file = kconfigdir / "ipython_kernel_config.py"
             kconfig_file.write_text("c.InteractiveShellApp.matplotlib = 'inline'")
@@ -407,10 +436,11 @@ class BaseRunner(metaclass=ABCMeta):
                     "We are skipping the runtime-specific initialization failure, "
                     "and the container may not work as expected."
                 )
-            await self._handle_exception(
-                init_sshd_service(self.child_env),
-                "Verify agent installation with the embedded prebuilt binaries",
-            )
+            if DROPBEAR_PATH.is_file():
+                await self._handle_exception(
+                    init_sshd_service(self.child_env),
+                    "Verify agent installation with the embedded prebuilt binaries",
+                )
         finally:
             if self.init_done is not None:
                 self.init_done.set()
@@ -1022,12 +1052,13 @@ class BaseRunner(metaclass=ABCMeta):
     async def run_subproc(self, cmd: str | list[str], batch: bool = False) -> int:
         """A thin wrapper for an external command."""
         loop = current_loop()
-        if Path("/home/work/.logs").is_dir():
+        if (self.work_dir / ".logs").is_dir():
             kernel_id = os.environ["BACKENDAI_KERNEL_ID"]
             kernel_id_hex = uuid.UUID(kernel_id).hex
-            log_path = Path(
-                "/home/work/.logs/task/"
-                f"{kernel_id_hex[:2]}/{kernel_id_hex[2:4]}/{kernel_id_hex[4:]}.log",
+            log_path = (
+                self.work_dir
+                / ".logs/task"
+                / f"{kernel_id_hex[:2]}/{kernel_id_hex[2:4]}/{kernel_id_hex[4:]}.log"
             )
             log_path.parent.mkdir(parents=True, exist_ok=True)
         else:
@@ -1162,14 +1193,14 @@ class BaseRunner(metaclass=ABCMeta):
     async def main_loop(self, cmdargs: Any) -> None:
         log.debug("starting user input server...")
         user_input_server = await asyncio.start_unix_server(
-            self.handle_user_input, "/tmp/bai-user-input.sock"
+            self.handle_user_input, self.user_input_sock_path
         )
         log.debug("initializing krunner...")
         await self._init_with_loop()
         log.debug("initializing jupyter kernel...")
         await self._init_jupyter_kernel()
 
-        user_bootstrap_path = Path("/home/work/bootstrap.sh")
+        user_bootstrap_path = self.work_dir / "bootstrap.sh"
         if user_bootstrap_path.is_file():
             log.debug("running user bootstrap script...")
             await self._bootstrap(user_bootstrap_path)
@@ -1179,26 +1210,28 @@ class BaseRunner(metaclass=ABCMeta):
 
         log.debug("starting intrinsic services: sshd, ttyd ...")
         intrinsic_spawn_coros = []
-        intrinsic_spawn_coros.append(
-            self._start_service(
-                {
-                    "name": "sshd",
-                    "port": self.intrinsic_host_ports_mapping.get("sshd", 2200),
-                    "protocol": "tcp",
-                },
-                launch_timeout=10.0,
+        if DROPBEAR_PATH.is_file():
+            intrinsic_spawn_coros.append(
+                self._start_service(
+                    {
+                        "name": "sshd",
+                        "port": self.intrinsic_host_ports_mapping.get("sshd", 2200),
+                        "protocol": "tcp",
+                    },
+                    launch_timeout=10.0,
+                )
             )
-        )
-        intrinsic_spawn_coros.append(
-            self._start_service(
-                {
-                    "name": "ttyd",
-                    "port": self.intrinsic_host_ports_mapping.get("ttyd", 7681),
-                    "protocol": "http",
-                },
-                launch_timeout=10.0,
+        if TTYD_PATH.is_file():
+            intrinsic_spawn_coros.append(
+                self._start_service(
+                    {
+                        "name": "ttyd",
+                        "port": self.intrinsic_host_ports_mapping.get("ttyd", 7681),
+                        "protocol": "http",
+                    },
+                    launch_timeout=10.0,
+                )
             )
-        )
         results = await asyncio.gather(*intrinsic_spawn_coros, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):

@@ -9,6 +9,8 @@ from typing import Any, Final, override
 __all__ = (
     "current_loop",
     "find_executable",
+    "get_config_dir",
+    "get_work_dir",
     "safe_close_task",
     "wait_local_port_open",
 )
@@ -20,6 +22,16 @@ else:
     current_loop = asyncio.get_event_loop
 
 CLOCK_TICK: Final = os.sysconf("SC_CLK_TCK")
+
+
+def get_work_dir() -> Path:
+    """HOME and cwd of user processes; overridden when the runner is a host process."""
+    return Path(os.environ.get("BACKENDAI_KERNEL_WORK_DIR", "/home/work"))
+
+
+def get_config_dir() -> Path:
+    """Where the agent puts environ.txt, intrinsic-ports.json and ssh keys."""
+    return Path(os.environ.get("BACKENDAI_KERNEL_CONFIG_DIR", "/home/config"))
 
 
 def find_executable(*paths: Path | str | bytes) -> Path | None:
@@ -88,6 +100,8 @@ async def wait_local_port_open(port: int) -> None:
 
 def scan_proc_stats() -> dict[int, dict[str, Any]]:
     pid_set: dict[int, dict[str, Any]] = {}
+    if not Path("/proc").is_dir():  # no procfs (e.g., macOS)
+        return pid_set
     for p in Path("/proc").iterdir():
         if p.name.isdigit():
             pid = int(p.name)

@@ -26,7 +26,9 @@ def _reexec_with_argv0(display_name: str) -> None:
         else:
             argv = [display_name, "-s", sys.argv[0]]
         venv = os.environ.get("VIRTUAL_ENV", None)
-        if venv is None:
+        # A venv interpreter (the agent's own, when run as a host process) locates its
+        # home through pyvenv.cfg; PYTHONHOME pointing at the venv would break it.
+        if venv is None and sys.prefix == sys.base_prefix:
             env["PYTHONHOME"] = sys.prefix
         # The process is re-executed in place, overriding argv and cmdline.
         os.execvpe(sys.executable, argv, env)

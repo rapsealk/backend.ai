@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .logging import BraceStyleAdapter
+from .utils import get_config_dir, get_work_dir
 
 log = BraceStyleAdapter(logging.getLogger())
 
-AGENT_HOST_KEY_PATH = Path("/home/config/ssh/dropbear_rsa_host_key")
+AGENT_HOST_KEY_PATH = get_config_dir() / "ssh/dropbear_rsa_host_key"
 # Legacy path where host key is generated inside container
 LEGACY_HOST_KEY_PATH = Path("/tmp/dropbear/dropbear_rsa_host_key")
 
@@ -20,7 +21,9 @@ async def init_sshd_service(child_env: MutableMapping[str, str]) -> None:
     if Path("/tmp/dropbear").is_dir():
         shutil.rmtree("/tmp/dropbear")
     Path("/tmp/dropbear").mkdir(parents=True, exist_ok=True)
-    auth_path = Path("/home/work/.ssh/authorized_keys")
+    work_dir = get_work_dir()
+    ssh_config_dir = get_config_dir() / "ssh"
+    auth_path = work_dir / ".ssh/authorized_keys"
     if not auth_path.is_file():
         auth_path.parent.mkdir(parents=True, exist_ok=True)
         auth_path.parent.chmod(0o700)
@@ -54,7 +57,7 @@ async def init_sshd_service(child_env: MutableMapping[str, str]) -> None:
                 "dropbear",
                 "openssh",
                 "/tmp/dropbear/id_dropbear",
-                "/home/work/id_container",
+                str(work_dir / "id_container"),
             ],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -70,7 +73,7 @@ async def init_sshd_service(child_env: MutableMapping[str, str]) -> None:
             if (auth_path.stat().st_mode & 0o077) != 0:
                 auth_path.chmod(0o600)
         except OSError:
-            log.warning("could not set the permission for /home/work/.ssh")
+            log.warning("could not set the permission for {}", auth_path.parent)
     # Check if agent-generated host key exists (mounted read-only from agent)
     # Generate host key only if agent-generated key is not present
     agent_host_key_exists = AGENT_HOST_KEY_PATH.is_file()
@@ -94,9 +97,9 @@ async def init_sshd_service(child_env: MutableMapping[str, str]) -> None:
         if proc.returncode != 0:
             raise RuntimeError(f"sshd init error: {stderr.decode('utf8')}")
 
-    cluster_privkey_src_path = Path("/home/config/ssh/id_cluster")
-    cluster_ssh_port_mapping_path = Path("/home/config/ssh/port-mapping.json")
-    user_ssh_config_path = Path("/home/work/.ssh/config")
+    cluster_privkey_src_path = ssh_config_dir / "id_cluster"
+    cluster_ssh_port_mapping_path = ssh_config_dir / "port-mapping.json"
+    user_ssh_config_path = work_dir / ".ssh/config"
     if cluster_privkey_src_path.is_file():
         replicas = {
             k: v
@@ -115,7 +118,7 @@ async def init_sshd_service(child_env: MutableMapping[str, str]) -> None:
                         f.write(f"\tHostName {hostname}\n")
                         f.write(f"\tPort {port}\n")
                         f.write("\tStrictHostKeyChecking no\n")
-                        f.write("\tIdentityFile /home/config/ssh/id_cluster\n")
+                        f.write(f"\tIdentityFile {cluster_privkey_src_path}\n")
 
             await asyncio.to_thread(_write_ssh_config)
         else:
@@ -132,10 +135,10 @@ async def init_sshd_service(child_env: MutableMapping[str, str]) -> None:
                         f.write(f"\nHost {role_name}*\n")
                         f.write("\tPort 2200\n")
                         f.write("\tStrictHostKeyChecking no\n")
-                        f.write("\tIdentityFile /home/config/ssh/id_cluster\n")
+                        f.write(f"\tIdentityFile {cluster_privkey_src_path}\n")
 
                 await asyncio.to_thread(_write_replica_config)
-    cluster_pubkey_src_path = Path("/home/config/ssh/id_cluster.pub")
+    cluster_pubkey_src_path = ssh_config_dir / "id_cluster.pub"
     if cluster_pubkey_src_path.is_file():
         pubkey = cluster_pubkey_src_path.read_bytes()
 
