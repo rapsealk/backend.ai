@@ -1429,6 +1429,115 @@
       "ui_option": {
         "ui_type": "text_input"
       }
+    },
+    {
+      "runtime_variant_name": "mlx-lm",
+      "name": "adapter-path",
+      "description": "Path to trained adapter (LoRA) weights applied on top of the model.",
+      "rank": 100,
+      "preset_target": "args",
+      "value_type": "str",
+      "default_value": null,
+      "key": "--adapter-path",
+      "category": "lora",
+      "display_name": "Adapter Path",
+      "ui_option": {
+        "ui_type": "text_input",
+        "text": {
+          "placeholder": "/models/adapters"
+        }
+      }
+    },
+    {
+      "runtime_variant_name": "mlx-lm",
+      "name": "trust-remote-code",
+      "description": "Trust remote code when loading the tokenizer.",
+      "rank": 200,
+      "preset_target": "args",
+      "value_type": "flag",
+      "default_value": null,
+      "key": "--trust-remote-code",
+      "category": "model_loading",
+      "display_name": "Trust Remote Code",
+      "ui_option": {
+        "ui_type": "checkbox"
+      }
+    },
+    {
+      "runtime_variant_name": "mlx-lm",
+      "name": "max-tokens",
+      "description": "Default maximum number of tokens to generate per request.",
+      "rank": 300,
+      "preset_target": "args",
+      "value_type": "int",
+      "default_value": "512",
+      "key": "--max-tokens",
+      "category": "serving_performance",
+      "display_name": "Max Tokens",
+      "ui_option": {
+        "ui_type": "number_input",
+        "number": {
+          "min": 1,
+          "max": 131072
+        }
+      }
+    },
+    {
+      "runtime_variant_name": "mlx-lm",
+      "name": "chat-template-args",
+      "description": "JSON arguments passed to the tokenizer's chat template.",
+      "rank": 400,
+      "preset_target": "args",
+      "value_type": "str",
+      "default_value": null,
+      "key": "--chat-template-args",
+      "category": "tool_reasoning",
+      "display_name": "Chat Template Args",
+      "ui_option": {
+        "ui_type": "text_input",
+        "text": {
+          "placeholder": "{\"enable_thinking\": false}"
+        }
+      }
+    },
+    {
+      "runtime_variant_name": "mlx-lm",
+      "name": "log-level",
+      "description": "Logging level of the server.",
+      "rank": 500,
+      "preset_target": "args",
+      "value_type": "str",
+      "default_value": "INFO",
+      "key": "--log-level",
+      "category": "monitoring",
+      "display_name": "Log Level",
+      "ui_option": {
+        "ui_type": "select",
+        "choices": {
+          "items": [
+            {
+              "value": "DEBUG",
+              "label": "Debug"
+            },
+            {
+              "value": "INFO",
+              "label": "Info"
+            },
+            {
+              "value": "WARNING",
+              "label": "Warning"
+            },
+            {
+              "value": "ERROR",
+              "label": "Error"
+            },
+            {
+              "value": "CRITICAL",
+              "label": "Critical"
+            }
+          ]
+        }
+      }
     }
   ]
 }

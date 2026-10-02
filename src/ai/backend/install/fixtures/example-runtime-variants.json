@@ -152,6 +152,29 @@
       }
     },
     {
+      "name": "mlx-lm",
+      "description": "MLX LM",
+      "reads_vfolder_config_files": false,
+      "default_model_definition": {
+        "models": [
+          {
+            "name": "mlx-lm-model",
+            "service": {
+              "start_command": "python -m mlx_lm server --model '{model_path}' --host 0.0.0.0 --port 8080",
+              "port": 8080,
+              "health_check": {
+                "enable": true,
+                "path": "/health",
+                "interval": 10.0,
+                "max_retries": 10,
+                "initial_delay": 1800.0
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "custom",
       "description": "Custom (Default)",
       "reads_vfolder_config_files": true,
