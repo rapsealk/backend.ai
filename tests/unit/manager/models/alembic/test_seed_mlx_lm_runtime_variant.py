@@ -132,6 +132,10 @@ class TestSeedMlxLmRuntimeVariant:
         assert service.port == 8080
         assert service.health_check is not None
         assert service.health_check.path == "/health"
+        assert service.pre_start_actions is not None
+        assert [(action.action, action.args) for action in service.pre_start_actions] == [
+            ("mkdir", {"path": ".cache/huggingface/hub"})
+        ]
 
     async def test_every_preset_is_written_for_the_variant(self, db: ExtendedAsyncSAEngine) -> None:
         await _upgrade(db)
