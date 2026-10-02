@@ -18,7 +18,7 @@ from ai.backend.common.dto.agent.response import CodeCompletionResp
 from ai.backend.common.events.dispatcher import EventProducer
 from ai.backend.common.types import CommitStatus, KernelId, SessionId
 
-from .process import LOG_FILENAME
+from .process import LOG_FILENAME, host_path_of, rebase_kernel_path
 
 _MAX_DOWNLOAD_SIZE: Final = 1048576  # 1 MiB, as in the Docker backend
 
@@ -99,6 +99,14 @@ class NativeKernel(AbstractKernel):
 
     @override
     async def start_model_service(self, model_service: Mapping[str, Any]) -> dict[str, Any]:
+        # The manager resolved the definition against kernel-side paths; point it at the host.
+        kernel_path: str = model_service["model_path"]
+        host_path = str(host_path_of(self._scratch_dir, kernel_path))
+        model_service = {**model_service, "model_path": host_path}
+        service = model_service.get("service")
+        if service and service.get("start_command"):
+            start_command = rebase_kernel_path(service["start_command"], kernel_path, host_path)
+            model_service["service"] = {**service, "start_command": start_command}
         return await self._runner().feed_start_model_service(model_service)
 
     @override

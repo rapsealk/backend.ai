@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
-from pathlib import Path
+import socket
+from collections.abc import Collection
+from pathlib import Path, PurePosixPath
 from typing import Final
 
 import psutil
@@ -14,6 +17,7 @@ from pydantic import BaseModel
 from ai.backend.agent.types import Container, Port
 from ai.backend.common.types import ContainerId, ContainerStatus, KernelId
 
+KERNEL_HOME: Final = PurePosixPath("/home/work")
 PROCESS_INFO_FILENAME: Final = "native-kernel.json"
 LOG_FILENAME: Final = "kernel.log"
 _CREATE_TIME_TOLERANCE: Final = 1.0
@@ -28,6 +32,7 @@ class KernelProcessInfo(BaseModel):
     image: str
     labels: dict[str, str]
     host_ports: list[int]
+    service_ports: list[int] = []  # declared by the kernel; they are host ports as they are
 
     def _is_leader(self, proc: psutil.Process) -> bool:
         return abs(proc.create_time() - self.create_time) < _CREATE_TIME_TOLERANCE
@@ -67,6 +72,21 @@ def config_dir_of(scratch_root: Path, kernel_id: KernelId) -> Path:
     return (scratch_root / str(kernel_id)).resolve() / "config"
 
 
+def host_path_of(scratch_dir: Path, kernel_path: str | os.PathLike[str]) -> Path:
+    """Map a kernel-side absolute path: /home/work/x to work/x, any other /x to mounts/x."""
+    target = PurePosixPath(os.path.normpath(kernel_path))
+    if target.is_relative_to(KERNEL_HOME):
+        return scratch_dir / "work" / target.relative_to(KERNEL_HOME)
+    return scratch_dir / "mounts" / target.relative_to("/")
+
+
+def rebase_kernel_path(command: str, kernel_path: str, host_path: str) -> str:
+    """Replace kernel_path in a command where it is a whole path or the head of one."""
+    # ponytail: the host path is not shell-quoted; a scratch root with spaces breaks the command.
+    pattern = rf"(?<![\w./-]){re.escape(kernel_path.rstrip('/'))}(?=$|[/\s'\"])"
+    return re.sub(pattern, lambda _: host_path, command)
+
+
 def read_process_info(config_dir: Path) -> KernelProcessInfo | None:
     try:
         return KernelProcessInfo.model_validate_json(
@@ -78,6 +98,27 @@ def read_process_info(config_dir: Path) -> KernelProcessInfo | None:
 
 def write_process_info(config_dir: Path, info: KernelProcessInfo) -> None:
     (config_dir / PROCESS_INFO_FILENAME).write_text(info.model_dump_json())
+
+
+def _is_listening(port: int) -> bool:
+    # ponytail: probes the loopback only; a listener bound to one other interface is missed.
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def find_port_conflicts(
+    scratch_root: Path, kernel_id: KernelId, ports: Collection[int]
+) -> list[int]:
+    """Ports that another kernel of this host declares, or that something already listens on."""
+    declared: set[int] = set()
+    for info_path in scratch_root.glob(f"*/config/{PROCESS_INFO_FILENAME}"):
+        if info_path.parents[1].name == str(kernel_id):
+            continue
+        # A record stays until its kernel is cleaned, so leftover children are covered too.
+        if (info := read_process_info(info_path.parent)) is not None:
+            declared.update(info.service_ports)
+    return sorted(port for port in set(ports) if port in declared or _is_listening(port))
 
 
 def _signal_group(pgid: int, sig: int) -> bool:

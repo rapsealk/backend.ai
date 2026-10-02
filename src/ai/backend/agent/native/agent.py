@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
@@ -28,6 +29,7 @@ from ai.backend.agent.config.unified import AgentUnifiedConfig
 from ai.backend.agent.errors import (
     InvalidArgumentError,
     InvalidMountPathError,
+    PortConflictError,
     UnsupportedResource,
 )
 from ai.backend.agent.errors.backend import (
@@ -76,10 +78,13 @@ from ai.backend.logging.structured import StructuredLogger
 
 from .kernel import NativeKernel
 from .process import (
+    KERNEL_HOME,
     LOG_FILENAME,
     PROCESS_INFO_FILENAME,
     KernelProcessInfo,
     config_dir_of,
+    find_port_conflicts,
+    host_path_of,
     read_process_info,
     terminate_process_group,
     write_process_info,
@@ -87,12 +92,13 @@ from .process import (
 
 log = StructuredLogger(logging.getLogger(__spec__.name))
 
-KERNEL_HOME: Final = PurePosixPath("/home/work")
 # create_kernel() addresses the runner by its in-container interpreter path.
 _CONTAINER_KRUNNER_PYTHON: Final = "/opt/backend.ai/bin/python"
 _DEFAULT_PATH: Final = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 _PASSTHROUGH_ENVS: Final = ("LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME")
 _TERMINATION_GRACE_PERIOD: Final = 10.0  # seconds, as `docker stop`
+# create_kernel() lists them for every kernel, but they need the container-side runner binaries.
+_CONTAINER_ONLY_SERVICES: Final = frozenset({"sshd", "ttyd"})
 
 
 def resolve_runtime_path(image_labels: Mapping[str, str]) -> Path:
@@ -108,20 +114,20 @@ def resolve_runtime_path(image_labels: Mapping[str, str]) -> Path:
     return runtime_path
 
 
-def link_mount(work_dir: Path, mount: Mount) -> None:
-    """Expose a mount as a symlink in the work dir at its path relative to /home/work."""
+def link_mount(scratch_dir: Path, mount: Mount) -> None:
+    """Expose a mount as a symlink in the scratch dir, at host_path_of() its kernel path."""
     target = PurePosixPath(os.path.normpath(mount.target))
     if (
         mount.type != MountTypes.BIND
         or mount.source is None
-        or target == KERNEL_HOME
-        or not target.is_relative_to(KERNEL_HOME)
+        or not target.is_absolute()
+        or target in (KERNEL_HOME, PurePosixPath("/"))
     ):
         raise InvalidMountPathError(
-            f"A host-process kernel can only mount host paths under {KERNEL_HOME} "
-            f"(got {mount.source} -> {mount.target})"
+            "A host-process kernel can only mount host paths at an absolute path "
+            f"other than / and {KERNEL_HOME} (got {mount.source} -> {mount.target})"
         )
-    link_path = work_dir / target.relative_to(KERNEL_HOME)
+    link_path = host_path_of(scratch_dir, target)
     link_path.parent.mkdir(parents=True, exist_ok=True)
     if link_path.is_symlink():  # re-created on kernel restarts
         link_path.unlink()
@@ -134,6 +140,7 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
     work_dir: Path
     runtime_path: Path
     port_pool: PortPool
+    service_port_lock: asyncio.Lock
 
     def __init__(
         self,
@@ -145,6 +152,7 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
         local_config: AgentUnifiedConfig,
         computers: Mapping[DeviceName, ComputerContext],
         port_pool: PortPool,
+        service_port_lock: asyncio.Lock,
         restarting: bool = False,
     ) -> None:
         super().__init__(
@@ -162,6 +170,7 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
         self.work_dir = self.scratch_dir / "work"
         self.runtime_path = resolve_runtime_path(self.image_labels)
         self.port_pool = port_pool
+        self.service_port_lock = service_port_lock
 
     @override
     async def get_extra_envs(self) -> Mapping[str, str]:
@@ -227,7 +236,7 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
     async def process_mounts(self, mounts: Sequence[Mount]) -> None:
         def _link_all() -> None:
             for mount in mounts:
-                link_mount(self.work_dir, mount)
+                link_mount(self.scratch_dir, mount)
 
         await run_in_executor_with_context(None, _link_all)
 
@@ -296,6 +305,10 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
         service_ports: list[ServicePort],
         cluster_info: ClusterInfo,
     ) -> NativeKernel:
+        # In place: create_kernel() reports this very list to the manager.
+        service_ports[:] = [
+            sport for sport in service_ports if sport["name"] not in _CONTAINER_ONLY_SERVICES
+        ]
         if not self.restarting:
             kernel_environ = {
                 # Keep the runner's own import path out of user processes.
@@ -303,6 +316,10 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
                 **environ,
                 "PATH": f"{self.runtime_path.parent}:{environ.get('PATH', _DEFAULT_PATH)}",
             }
+            if model_path := environ.get("BACKEND_MODEL_PATH"):
+                kernel_environ["BACKEND_MODEL_PATH"] = str(
+                    host_path_of(self.scratch_dir, model_path)
+                )
             with StringIO() as buf:
                 resource_spec.write_to_file(buf)
                 for dev_type, device_alloc in resource_spec.allocations.items():
@@ -347,7 +364,9 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
             "BACKENDAI_KERNEL_BIND_HOST": "127.0.0.1",
         }
 
-    def _spawn(self, argv: Sequence[str], host_ports: Sequence[int]) -> KernelProcessInfo:
+    def _spawn(
+        self, argv: Sequence[str], host_ports: Sequence[int], service_ports: Sequence[int]
+    ) -> KernelProcessInfo:
         labels: dict[str, str] = {
             LabelName.AGENT_ID: str(self.agent_id),
             LabelName.KERNEL_ID: str(self.kernel_id),
@@ -380,6 +399,7 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
                 image=self.image_ref.canonical,
                 labels=labels,
                 host_ports=list(host_ports),
+                service_ports=list(service_ports),
             )
             write_process_info(self.config_dir, info)
         except BaseException:
@@ -402,14 +422,32 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
             raise InvalidArgumentError(f"Unexpected kernel runner command: {cmdargs}")
         # Drops a jail prefix as well: there is no sandbox to run it in.
         argv = [sys.executable, *cmdargs[cmdargs.index(_CONTAINER_KRUNNER_PYTHON) + 1 :]]
-        host_ports = [self.port_pool.acquire() for _ in self.repl_ports]
-        try:
-            info = await run_in_executor_with_context(None, self._spawn, argv, host_ports)
-        except Exception:
-            self.port_pool.release_many(host_ports)
-            raise
+        # No NAT in front of a host process: the declared port is the host port.
+        service_ports = sorted({
+            port for sport in kernel_obj.service_ports for port in sport["container_ports"]
+        })
+        # Held until the record is written, so that concurrent creations see each other's ports.
+        async with self.service_port_lock:
+            conflicts = await run_in_executor_with_context(
+                None,
+                find_port_conflicts,
+                self.local_config.container.scratch_root,
+                self.kernel_id,
+                service_ports,
+            )
+            if conflicts:
+                raise PortConflictError(
+                    f"Service ports already in use on the agent host: {conflicts}"
+                )
+            host_ports = [self.port_pool.acquire() for _ in self.repl_ports]
+            try:
+                info = await run_in_executor_with_context(
+                    None, self._spawn, argv, host_ports, service_ports
+                )
+            except Exception:
+                self.port_pool.release_many(host_ports)
+                raise
         for sport in kernel_obj.service_ports:
-            # No NAT in front of a host process: the declared port is the host port.
             sport["host_ports"] = tuple(sport["container_ports"])
         container_config = self.local_config.container
         return {
@@ -426,6 +464,12 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
 
 
 class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
+    _service_port_lock: asyncio.Lock
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._service_port_lock = asyncio.Lock()
+
     @override
     async def __ainit__(self) -> None:
         log.info(
@@ -547,6 +591,7 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
             self.local_config,
             self.computers,
             self.port_pool,
+            self._service_port_lock,
             restarting=restarting,
         )
 
