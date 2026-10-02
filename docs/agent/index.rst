@@ -7,4 +7,5 @@ Backend.AI Agent Reference
    rpc
    docker
    k8s
+   native
    accelerators
