@@ -45,3 +45,33 @@ class InstanceAlreadyExistsError(BackendAIError, web.HTTPConflict):
             operation=ErrorOperation.CREATE,
             error_detail=ErrorDetail.ALREADY_EXISTS,
         )
+
+
+class KernelRuntimeNotFoundError(BackendAIError, web.HTTPBadRequest):
+    """Raised when the image's runtime path is not an executable on the agent host."""
+
+    error_type = "https://api.backend.ai/probs/agent/kernel-runtime-not-found"
+    error_title = "Kernel runtime not found on the agent host."
+
+    @override
+    def error_code(self) -> ErrorCode:
+        return ErrorCode(
+            domain=ErrorDomain.IMAGE,
+            operation=ErrorOperation.ACCESS,
+            error_detail=ErrorDetail.NOT_FOUND,
+        )
+
+
+class UnsupportedBackendOperationError(BackendAIError, web.HTTPNotImplemented):
+    """Raised when the agent backend does not implement the requested operation."""
+
+    error_type = "https://api.backend.ai/probs/agent/unsupported-backend-operation"
+    error_title = "The agent backend does not support this operation."
+
+    @override
+    def error_code(self) -> ErrorCode:
+        return ErrorCode(
+            domain=ErrorDomain.AGENT,
+            operation=ErrorOperation.GENERIC,
+            error_detail=ErrorDetail.NOT_IMPLEMENTED,
+        )
