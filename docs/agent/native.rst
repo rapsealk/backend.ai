@@ -95,6 +95,8 @@ The agent reads its labels and never runs it; ``ai.backend.runtime-path`` names 
    ./bai gql 'mutation { rescan_images(registry: "local") { ok msg task_id } }'
    ./bai admin image search --name-contains mlx-lm
 
+The agent reports an image as installed once the manager has handed it over, at the first session or deployment that uses it, and while its ``ai.backend.runtime-path`` is an executable on the host. Clients that list installed images only (the FastTrack task editor) show it from then on; the YAML editor and the CLI accept it from the start.
+
 The search lists ``local/stable/mlx-lm:0.32-macos`` with architecture ``aarch64``. Note its ``id``.
 
 ``./backend.ai mgr image rescan local`` fails with a SQLAlchemy mapper error; use the GraphQL mutation.
