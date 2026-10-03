@@ -41,7 +41,9 @@ from ai.backend.agent.native.process import (
     KernelProcessInfo,
     find_port_conflicts,
     host_path_of,
+    mount_env_name,
     read_process_info,
+    rebase_env_value,
     rebase_kernel_path,
     terminate_process_group,
     write_process_info,
@@ -164,6 +166,28 @@ class TestLinkMount:
         )
         with pytest.raises(InvalidMountPathError):
             link_mount(scratch_dir, mount)
+
+
+class TestEnvRewrite:
+    MOUNTS = {"/home/work/data": "/s/work/data", "/models": "/s/mounts/models"}
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("/models", "/s/mounts/models"),
+            ("/models/sub/x.bin", "/s/mounts/models/sub/x.bin"),
+            ("/home/work/data/train.jsonl", "/s/work/data/train.jsonl"),
+            ("/models2", "/models2"),
+            ("see /models here", "see /models here"),
+            ("", ""),
+        ],
+    )
+    def test_rewrites_only_values_that_are_mount_paths(self, value: str, expected: str) -> None:
+        assert rebase_env_value(value, self.MOUNTS) == expected
+
+    def test_mount_variable_is_named_by_the_last_component(self) -> None:
+        assert mount_env_name("/home/work/tune-dataset") == "BACKENDAI_MOUNT_TUNE_DATASET"
+        assert mount_env_name("/models/") == "BACKENDAI_MOUNT_MODELS"
 
 
 class TestModelPathRebase:

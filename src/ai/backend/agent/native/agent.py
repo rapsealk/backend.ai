@@ -96,7 +96,9 @@ from .process import (
     config_dir_of,
     find_port_conflicts,
     host_path_of,
+    mount_env_name,
     read_process_info,
+    rebase_env_value,
     terminate_process_group,
     write_process_info,
 )
@@ -321,15 +323,22 @@ class NativeKernelCreationContext(AbstractKernelCreationContext[NativeKernel]):
             sport for sport in service_ports if sport["name"] not in _CONTAINER_ONLY_SERVICES
         ]
         if not self.restarting:
+            # Values naming a mount by its kernel path (BACKEND_MODEL_PATH, the
+            # caller's own variables) must reach the process as host paths.
+            mounts = {
+                str(mount.target).rstrip("/"): str(host_path_of(self.scratch_dir, mount.target))
+                for mount in resource_spec.mounts
+            }
             kernel_environ = {
                 # Keep the runner's own import path out of user processes.
                 "PYTHONPATH": "",
-                **environ,
+                **{k: rebase_env_value(v, mounts) for k, v in environ.items()},
+                **{mount_env_name(k): v for k, v in mounts.items()},
                 "PATH": f"{self.runtime_path.parent}:{environ.get('PATH', _DEFAULT_PATH)}",
             }
-            if model_path := environ.get("BACKEND_MODEL_PATH"):
-                kernel_environ["BACKEND_MODEL_PATH"] = str(
-                    host_path_of(self.scratch_dir, model_path)
+            if persistent_paths := environ.get("BACKENDAI_PERSISTENT_PATHS"):
+                kernel_environ["BACKENDAI_PERSISTENT_PATHS"] = ":".join(
+                    rebase_env_value(p, mounts) for p in persistent_paths.split(":")
                 )
             with StringIO() as buf:
                 resource_spec.write_to_file(buf)

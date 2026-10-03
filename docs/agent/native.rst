@@ -46,6 +46,8 @@ Limits
      - The home directory is ``<scratch-root>/<kernel-id>/work``. Address vfolders relative to the home directory.
    * - Mounts outside ``/home/work``
      - A mount at ``/models`` is the symlink ``<scratch-root>/<kernel-id>/mounts/models``. The model path of an inference session is rewritten to it.
+   * - Kernel paths in environment variables
+     - A value that is a mount's kernel path, or a path under one, is rewritten to the host path (``DATASET_FILE=/home/work/data/train.jsonl`` reaches the process as the host path). ``BACKENDAI_PERSISTENT_PATHS`` is rewritten element-wise. Every mount also sets ``BACKENDAI_MOUNT_<NAME>`` to its host path, ``<NAME>`` being the last path component upper-cased with non-alphanumerics as ``_``. Paths inside commands are not rewritten.
    * - Read-only mounts
      - Not enforced; a mount is a symlink to the vfolder host path.
    * - Service ports
