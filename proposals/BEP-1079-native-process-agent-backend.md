@@ -204,7 +204,7 @@ An image row supplies labels and nothing else. Nothing is pulled.
 
 Registration in the first cut: a Docker image that carries the labels and no filesystem content, scanned through the `local` registry. `architecture` of the row is the agent's (`aarch64`).
 
-The agent does not report installed images. It checks the runtime path at kernel creation; a path that is not an executable on the host fails the creation.
+The agent has no registry access, so it learns an image only when the manager hands it over (`check_and_pull` before scheduling, kernel creation). It records canonical, architecture, digest and runtime path in `<var-base-path>/native-images.<agent-id>.json` and reports the image as installed while the runtime path is an executable on the host. An image is schedulable before it is reported installed; a runtime path that is not an executable fails the kernel creation.
 
 ### 4.6 Ports
 

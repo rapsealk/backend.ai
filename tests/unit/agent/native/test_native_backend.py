@@ -34,6 +34,7 @@ from ai.backend.agent.native.agent import (
     link_mount,
     resolve_runtime_path,
 )
+from ai.backend.agent.native.images import record_images, scan_records
 from ai.backend.agent.native.intrinsic import MemoryPlugin
 from ai.backend.agent.native.kernel import NativeKernel
 from ai.backend.agent.native.process import (
@@ -60,9 +61,12 @@ from ai.backend.common.events.event_types.kernel.types import KernelLifecycleEve
 from ai.backend.common.events.event_types.session.anycast import SessionFailureAnycastEvent
 from ai.backend.common.types import (
     AgentId,
+    AutoPullBehavior,
     ContainerStatus,
     DeviceId,
     DeviceName,
+    ImageCanonical,
+    ImageConfig,
     KernelId,
     MountPermission,
     MountTypes,
@@ -188,6 +192,52 @@ class TestEnvRewrite:
     def test_mount_variable_is_named_by_the_last_component(self) -> None:
         assert mount_env_name("/home/work/tune-dataset") == "BACKENDAI_MOUNT_TUNE_DATASET"
         assert mount_env_name("/models/") == "BACKENDAI_MOUNT_MODELS"
+
+
+class TestInstalledImages:
+    def _config(self, canonical: str, runtime_path: str) -> ImageConfig:
+        return {
+            "canonical": canonical,
+            "project": None,
+            "architecture": "aarch64",
+            "digest": "sha256:abc",
+            "repo_digest": None,
+            "registry": {"name": "local", "url": "", "username": None, "password": None},
+            "labels": {LabelName.RUNTIME_PATH: runtime_path},
+            "is_local": True,
+            "auto_pull": AutoPullBehavior.NONE,
+        }
+
+    def test_only_images_with_an_executable_runtime_are_installed(self, tmp_path: Path) -> None:
+        path = tmp_path / "native-images.json"
+        record_images(path, [self._config("local/a:1", sys.executable)])
+        record_images(path, [self._config("local/b:1", str(tmp_path / "missing"))])
+
+        result = scan_records(path, {})
+
+        assert list(result.scanned_images) == ["local/a:1"]
+        info = result.scanned_images[ImageCanonical("local/a:1")]
+        assert (info.architecture, info.digest) == ("aarch64", "sha256:abc")
+
+    def test_an_image_whose_runtime_vanished_is_reported_removed(self, tmp_path: Path) -> None:
+        path = tmp_path / "native-images.json"
+        runtime = tmp_path / "python"
+        runtime.write_text("")
+        runtime.chmod(0o755)
+        record_images(path, [self._config("local/a:1", str(runtime))])
+        reported = scan_records(path, {}).scanned_images
+        runtime.unlink()
+
+        result = scan_records(path, reported)
+
+        assert result.scanned_images == {}
+        assert list(result.removed_images) == ["local/a:1"]
+
+    def test_missing_or_broken_file_means_nothing_installed(self, tmp_path: Path) -> None:
+        path = tmp_path / "native-images.json"
+        assert scan_records(path, {}).scanned_images == {}
+        path.write_text("{not json")
+        assert scan_records(path, {}).scanned_images == {}
 
 
 class TestModelPathRebase:

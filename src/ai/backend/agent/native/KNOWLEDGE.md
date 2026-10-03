@@ -63,7 +63,7 @@ It exists because no Linux container on macOS reaches Metal, so a session that u
 
 - The image row supplies labels; nothing is pulled, scanned, pushed or committed.
 - `ai.backend.runtime-path` must be an executable on the agent host, else `KernelRuntimeNotFoundError`; its directory is prepended to `PATH`.
-- The agent does not report installed images; a wrong runtime path surfaces at kernel creation.
+- The agent learns an image's metadata only when the manager hands it over (`check_and_pull`, kernel creation). It keeps it in `<var-base-path>/native-images.<agent-id>.json` and reports the image as installed while the runtime path is an executable; an image never used on this agent is not reported.
 
 ## A clean without a destroy is a death
 

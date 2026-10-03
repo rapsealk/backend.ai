@@ -87,6 +87,7 @@ from ai.backend.common.types import (
 )
 from ai.backend.logging.structured import StructuredLogger
 
+from .images import images_file, record_images, scan_records
 from .kernel import NativeKernel
 from .process import (
     KERNEL_HOME,
@@ -572,10 +573,23 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
     async def extract_image_command(self, image: str) -> list[str] | None:
         return None
 
+    @property
+    def _images_file(self) -> Path:
+        return images_file(self.local_config.agent.var_base_path, str(self.id))
+
+    @override
+    async def check_and_pull(self, image_configs: Mapping[str, ImageConfig]) -> dict[str, str]:
+        # The manager hands over image metadata only here and at kernel creation; keep it.
+        await run_in_executor_with_context(
+            None, record_images, self._images_file, list(image_configs.values())
+        )
+        return await super().check_and_pull(image_configs)
+
     @override
     async def scan_images(self) -> ScanImagesResult:
-        # Images are metadata only; whether one is usable is checked at kernel creation.
-        return ScanImagesResult(scanned_images={}, removed_images={})
+        return await run_in_executor_with_context(
+            None, scan_records, self._images_file, self.images
+        )
 
     @override
     async def pull_image(
@@ -618,6 +632,9 @@ class NativeAgent(AbstractAgent[NativeKernel, NativeKernelCreationContext]):
         cluster_ssh_port_mapping: ClusterSSHPortMapping | None = None,
     ) -> NativeKernelCreationContext:
         distro = await self.resolve_image_distro(kernel_config["image"])
+        await run_in_executor_with_context(
+            None, record_images, self._images_file, [kernel_config["image"]]
+        )
         return NativeKernelCreationContext(
             ownership_data,
             self.event_producer,
