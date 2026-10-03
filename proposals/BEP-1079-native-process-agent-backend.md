@@ -175,7 +175,8 @@ Manager ──RPC──▶ NativeAgent ──spawn──▶ kernel runner (host 
 | `/home/config` | `<scratch-root>/<kernel-id>/config` |
 
 - A mount is a symlink at the mapped path to the vfolder host path. `/` and `/home/work` are refused as mount targets.
-- For an inference session, `model_path`, that path inside the start command, and `BACKEND_MODEL_PATH` are rewritten to the host path. `pre_start_actions` arguments are not.
+- An `environ` value that is a mount's kernel path, or a path under one, is rewritten to the host path; `BACKENDAI_PERSISTENT_PATHS` element-wise. Each mount sets `BACKENDAI_MOUNT_<NAME>` (last path component, upper-cased, non-alphanumerics as `_`) to its host path.
+- For an inference session, `model_path` and that path inside the start command are rewritten to the host path. Other command text and `pre_start_actions` arguments are not.
 
 Files the backend adds:
 

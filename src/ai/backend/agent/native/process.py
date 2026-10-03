@@ -7,7 +7,7 @@ import os
 import re
 import signal
 import socket
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Final
 
@@ -80,6 +80,20 @@ def host_path_of(scratch_dir: Path, kernel_path: str | os.PathLike[str]) -> Path
     if target.is_relative_to(KERNEL_HOME):
         return scratch_dir / "work" / target.relative_to(KERNEL_HOME)
     return scratch_dir / "mounts" / target.relative_to("/")
+
+
+def mount_env_name(kernel_path: str | os.PathLike[str]) -> str:
+    """BACKENDAI_MOUNT_<NAME> for a mount, NAME being its last path component."""
+    name = re.sub(r"[^A-Za-z0-9]", "_", PurePosixPath(kernel_path).name).upper()
+    return f"BACKENDAI_MOUNT_{name}"
+
+
+def rebase_env_value(value: str, mounts: Mapping[str, str]) -> str:
+    """Rewrite a value that is a mount's kernel path, or a path under one, to the host path."""
+    for kernel_path, host_path in mounts.items():
+        if value == kernel_path or value.startswith(kernel_path + "/"):
+            return host_path + value[len(kernel_path) :]
+    return value
 
 
 def rebase_kernel_path(command: str, kernel_path: str, host_path: str) -> str:

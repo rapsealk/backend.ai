@@ -50,7 +50,7 @@ It exists because no Linux container on macOS reaches Metal, so a session that u
 
 - A mount is a symlink at the mapped path; read-only is not enforced.
 - `/` and `/home/work` themselves cannot be mount targets.
-- An inference session's `model_path`, the same path inside its start command, and `BACKEND_MODEL_PATH` are rewritten to the host path.
+- An `environ` value that is a mount's kernel path, or a path under one, is rewritten to the host path; `BACKENDAI_PERSISTENT_PATHS` element-wise. `BACKENDAI_MOUNT_<NAME>` carries each mount's host path. Paths inside commands are not rewritten, except an inference session's `model_path` inside its start command.
 
 ## The declared port is the host port
 
